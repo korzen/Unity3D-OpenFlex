@@ -1,0 +1,384 @@
+﻿#pragma kernel PredictPositions
+#pragma kernel ComputeSpringForces
+#pragma kernel Integrate
+#pragma kernel ProjectInternalConstraints
+#pragma kernel AddTempToPredicted
+#pragma kernel ProjectSpaceBounds
+#pragma kernel ProjectSphereCollisions
+#pragma kernel AddTempToVelocities
+
+
+//#pragma enable_d3d11_debug_symbols
+
+
+struct Link
+{
+	int idA;
+	int idB;
+	float restLength;
+	int type;
+};
+
+RWStructuredBuffer<float4> posBuffer;
+RWStructuredBuffer<float4> predPosBuffer;
+RWStructuredBuffer<float4> tempBuffer;
+RWStructuredBuffer<float4> velBuffer;
+RWStructuredBuffer<float4> forceBuffer;
+
+StructuredBuffer<int> phaseBuffer;
+
+StructuredBuffer<float> invMassesBuffer;
+StructuredBuffer<float4> initialPosBuffer;
+StructuredBuffer<float> springRestLengthBuffer;
+StructuredBuffer<int> springIdsBuffer;
+StructuredBuffer<Link> linksBuffer;
+
+float gridSizeX;
+float gridSizeY;
+float gridSizeZ;
+
+int pointsCount;
+int springsCount;
+int maxSpringsCount;
+
+float radius;
+float dt;
+float Ks;
+float Kd;
+float Ks2;
+float Kd2;
+float damping;
+float3 gravity;
+
+RWByteAddressBuffer Accum : register(u0);
+
+void atomicAddFloat(uint addr, float value)
+{
+	uint comp, orig = Accum.Load(addr);
+	[allow_uav_condition] do
+	{
+		Accum.InterlockedCompareExchange(addr, comp = orig, asuint(asfloat(orig) + value), orig);
+	} while (orig != comp);
+}
+
+void atomicAddFloat2(uint addr, float value)  // Works perfectly!
+{
+	uint i_val = asuint(value);
+	uint tmp0 = 0;
+	uint tmp1;
+	[allow_uav_condition] while (true)
+	{
+		Accum.InterlockedCompareExchange(addr, tmp0, i_val, tmp1);
+		if (tmp1 == tmp0)
+			break;
+		tmp0 = tmp1;
+		i_val = asuint(value + asfloat(tmp1));
+	}
+}
+
+[numthreads(32, 1, 1)]
+void PredictPositions(uint3 id : SV_DispatchThreadID)
+{
+
+	if (id.x < pointsCount)
+	{
+		float3 pos = posBuffer[id.x].xyz;
+		float3 predPos = predPosBuffer[id.x].xyz;
+		float3 vel = velBuffer[id.x].xyz;
+		float3 force = forceBuffer[id.x].xyz;
+		float invMass = invMassesBuffer[id.x];
+
+		if (invMass != 0.0f)
+		{
+			//	force -= vel * damping;
+			vel += force * dt * invMass;
+			vel *= (1.0f - damping);
+			predPos = pos + vel * dt;
+		}
+		else
+		{
+			//vel = 0.0f;
+			predPos = pos;
+		}
+
+		predPosBuffer[id.x] = float4(predPos, 0.0f);
+	}
+}
+
+
+[numthreads(32, 1, 1)]
+void ComputeSpringForces(uint3 id : SV_DispatchThreadID)
+{
+
+	if (id.x < pointsCount)
+	{
+		float3 posA = posBuffer[id.x].xyz;
+		float3 velA = velBuffer[id.x].xyz;
+
+		float3 springForce = float3(0, 0, 0);
+
+		for (int s = 0; s < maxSpringsCount; s++)
+		{
+			int idB = springIdsBuffer[id.x * maxSpringsCount + s];
+
+			if (idB != -1)
+			{
+				float restLength = springRestLengthBuffer[id.x * maxSpringsCount + s];
+
+				float3 deltaP = posA - posBuffer[idB].xyz;
+				float3 deltaV = velA - velBuffer[idB].xyz;
+
+				float dist = length(deltaP);
+
+				if (dist > 0.000001f)
+				{
+					float leftTerm = -Ks * (dist - restLength);
+					float rightTerm = -Kd * (dot(deltaV, deltaP) / dist);
+					springForce += (leftTerm + rightTerm) * normalize(deltaP);
+				}
+
+
+			}
+		}
+
+
+		if (Ks2 > 0.0f)
+		{
+			float3 deltaP = posA - initialPosBuffer[id.x].xyz;
+			float3 deltaV = velA;
+
+			float dist = length(deltaP);
+			if (dist > 0.000001f)
+			{
+
+				float leftTerm = -Ks2 * dist;
+				float rightTerm = -Kd2 * (dot(deltaV, deltaP) / dist);
+
+				springForce += (leftTerm + rightTerm) * normalize(deltaP);
+			}
+		}
+
+		forceBuffer[id.x] += float4(springForce, 0.0f);
+	}
+
+}
+
+//[numthreads(32,1,1)]
+//void ComputeSpringForces (uint3 id : SV_DispatchThreadID)
+//{
+
+//	if(id.x < springsCount)
+//	{
+//		Link link = linksBuffer[id.x];
+
+//		float3 deltaP = posBuffer[link.idA].xyz - posBuffer[link.idB].xyz;
+
+//		float dist = length(deltaP);
+
+//		if (dist > 0.000001f)
+//		{
+//			float3 deltaV = velBuffer[link.idA].xyz - velBuffer[link.idB].xyz;
+
+//			float leftTerm  = -Ks * (dist - link.restLength);
+//			float rightTerm = -Kd * ( dot(deltaV, deltaP) / dist );
+
+//			float3 springForce = (leftTerm + rightTerm) * normalize(deltaP);
+
+//		//	atomicAdd(&(d_force[n_idx].x), val_x);
+//		//	atomicAdd(&(d_force[n_idx].y), val_y);
+//		//	atomicAdd(&(d_force[n_idx].z), val_z);
+
+//			//forceBuffer[link.idA] += float4(springForce, 0.0f);
+//			atomicAddFloat2(forceBuffer[link.idA].x, springForce.x);
+//			atomicAddFloat2(forceBuffer[link.idA].y, springForce.y);
+//			atomicAddFloat2(forceBuffer[link.idA].z, springForce.z);
+
+//			//forceBuffer[link.idB] -= float4(springForce, 0.0f);
+//			atomicAddFloat2(forceBuffer[link.idB].x, -springForce.x);
+//			atomicAddFloat2(forceBuffer[link.idB].y, -springForce.y);
+//			atomicAddFloat2(forceBuffer[link.idB].z, -springForce.z);
+//		}
+
+
+//	}
+
+//}
+
+[numthreads(32, 1, 1)]
+void Integrate(uint3 id : SV_DispatchThreadID)
+{
+
+	if (id.x < pointsCount)
+	{
+		float3 pos = posBuffer[id.x].xyz;
+		float3 predPos = predPosBuffer[id.x].xyz;
+
+		//if (body.posLocks[i])
+		//	continue;
+
+		float3 vel = (predPos - pos) / dt;
+		pos = predPos;
+
+		posBuffer[id.x] = float4(pos, 0.0f);
+		velBuffer[id.x] = float4(vel, 0.0f);
+		forceBuffer[id.x] = float4(gravity, 0.0f);
+
+	}
+}
+
+[numthreads(32, 1, 1)]
+void ProjectInternalConstraints(uint3 id : SV_DispatchThreadID)
+{
+
+	if (id.x < pointsCount)
+	{
+		float3 predPosA = predPosBuffer[id.x].xyz;
+		float wA = invMassesBuffer[id.x];
+
+		float3 deltaP = float3(0, 0, 0);
+		int constraintsCount = 0;
+		for (int s = 0; s < maxSpringsCount; s++)
+		{
+			int idB = springIdsBuffer[id.x * maxSpringsCount + s];
+
+			if (idB != -1)
+			{
+				float3 predPosB = predPosBuffer[idB].xyz;
+
+				float restLength = springRestLengthBuffer[id.x * maxSpringsCount + s];
+
+				float3 dir = predPosA - predPosB;
+
+				float dist = length(dir);
+
+				if (dist > 0.000001f)
+				{
+					float wB = invMassesBuffer[idB];
+					float invMass = wA + wB;
+					if (invMass == 0)
+						continue;
+
+					float3 dP = (1.0f / invMass) * (dist - restLength) * normalize(dir) * Ks;
+					deltaP -= dP * wA;
+					constraintsCount++;
+				}
+			}
+		}
+
+		if (constraintsCount > 0)
+			tempBuffer[id.x] = float4(deltaP / constraintsCount, 0.0f);
+		else
+			tempBuffer[id.x] = float4(0, 0, 0, 0);
+		//	predPosBuffer[id.x] += float4(deltaP/constraintsCount, 0.0f);
+	}
+
+}
+
+[numthreads(32, 1, 1)]
+void AddTempToPredicted(uint3 id : SV_DispatchThreadID)
+{
+
+	if (id.x < pointsCount)
+	{
+		predPosBuffer[id.x] += tempBuffer[id.x];
+	}
+
+}
+
+[numthreads(32, 1, 1)]
+void ProjectSpaceBounds(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x < pointsCount)
+	{
+		float3 pos = predPosBuffer[id.x].xyz;
+		float3 vel = velBuffer[id.x].xyz;
+
+		//float x = clamp(pos.x, 0+radius, gridSizeX-radius);
+		//float y = clamp(pos.y, 0+radius, gridSizeY-radius);
+		//float z = clamp(pos.z, 0+radius, gridSizeZ-radius);
+
+		if (pos.x < radius) {
+			vel.x = 0;
+			pos.x = radius;
+		}
+		else if (pos.x > gridSizeX - radius) {
+			vel.x = 0;
+			pos.x = gridSizeX - radius;
+		}
+
+		if (pos.y < radius) {
+			vel.y = 0;
+			pos.y = radius;
+		}
+		else if (pos.y > gridSizeY - radius) {
+			vel.y = 0;
+			pos.y = gridSizeY - radius;
+		}
+
+		if (pos.z < radius) {
+			vel.z = 0;
+			pos.z = radius;
+		}
+		else if (pos.z > gridSizeZ - radius) {
+			vel.z = 0;
+			pos.z = gridSizeZ - radius;
+		}
+
+		predPosBuffer[id.x] = float4(pos, 0);
+		velBuffer[id.x] = float4(vel, 0);
+	}
+
+}
+
+[numthreads(32, 1, 1)]
+void ProjectSphereCollisions(uint3 id : SV_DispatchThreadID)
+{
+
+	if (id.x < pointsCount)
+	{
+		float3 predPosA = predPosBuffer[id.x].xyz;
+		float3 deltaP = float3(0, 0, 0);
+
+		for (int idB = 0; idB < pointsCount; idB++)
+		{
+			if (idB == id.x)
+				continue;
+
+			float3 predPosB = predPosBuffer[idB].xyz;
+
+			float3 dir = predPosA - predPosB;
+
+			float dist = length(dir);
+
+			float radiusSum = radius + radius;
+
+			if (dist <= radiusSum)
+			{
+				float wA = invMassesBuffer[id.x];
+				float wB = invMassesBuffer[idB];
+				float invMass = wA + wB;
+
+				float3 dP = (1.0f / invMass) * (dist - radiusSum) * normalize(dir) * Ks;
+				deltaP -= dP * wA;
+
+			}
+
+		}
+		//	predPosBuffer[id.x] +=  float4(deltaP, 0.0f);
+		tempBuffer[id.x] = float4(deltaP, 0.0f);
+
+	}
+
+}
+
+
+[numthreads(32, 1, 1)]
+void AddTempToVelocities(uint3 id : SV_DispatchThreadID)
+{
+
+	if (id.x < pointsCount)
+	{
+		velBuffer[id.x] += tempBuffer[id.x] * dt;
+	}
+
+}

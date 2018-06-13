@@ -1,0 +1,185 @@
+﻿#pragma kernel ConstructGrid
+#pragma kernel ClearGrid
+#pragma kernel FindNeighboursInCells
+#pragma kernel FindNeighboursInRadius
+#pragma kernel FindNeighboursInRadiusBruteForce
+
+//#pragma enable_d3d11_debug_symbols
+
+RWStructuredBuffer<int> cellBuffer;
+RWStructuredBuffer<int> cellSizeBuffer;
+RWStructuredBuffer<int> cellNeighboursBuffer;
+
+RWStructuredBuffer<int> neighboursCountBuffer;
+RWStructuredBuffer<int> neighboursIdsBuffer;
+
+RWStructuredBuffer<int> debugBuffer;
+
+RWStructuredBuffer<float4> predPosBuffer;
+
+int gridSizeX;
+int gridSizeY;
+int gridSizeZ;
+
+int pointsCount;
+
+int maxPointsPerCell;
+int maxNeighboursPerPoint;
+
+float searchRadius;
+
+
+[numthreads(32, 1, 1)]
+void ConstructGrid(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x < pointsCount)
+	{
+		float3 pos = predPosBuffer[id.x].xyz;
+
+		if ((int)pos.x >= 0 && (int)pos.y >= 0 && (int)pos.z >= 0 && (int)pos.x <= gridSizeX && (int)pos.y <= gridSizeY && (int)pos.z <= gridSizeZ)
+		{
+			int cellId = (int)pos.x + (int)pos.y * gridSizeX + (int)pos.z * gridSizeX * gridSizeY;
+
+			int cellSize;
+			InterlockedAdd(cellSizeBuffer[cellId], 1, cellSize); //cellSize can grow beyond given threshold
+																 //	i = min(i, sp.maxParticles - 1);
+			cellSize = min(cellSize, maxPointsPerCell - 1);
+			cellBuffer[cellId * maxPointsPerCell + cellSize] = id.x;
+		}
+
+	}
+}
+
+[numthreads(8, 8, 8)]
+void ClearGrid(uint3 id : SV_DispatchThreadID)
+{
+	int idx = id.x + id.y * gridSizeX + id.z * gridSizeX * gridSizeY;
+	cellSizeBuffer[idx] = 0;
+}
+
+[numthreads(32, 1, 1)]
+void FindNeighboursInCells(uint3 id : SV_DispatchThreadID)
+{
+
+	if (id.x < pointsCount)
+	{
+		float3 predPosA = predPosBuffer[id.x].xyz;
+		float3 deltaP = float3(0, 0, 0);
+		int totalNeighboursCount = 0;
+
+		int cellId = (int)predPosA.x + (int)predPosA.y * gridSizeX + (int)predPosA.z * gridSizeX * gridSizeY;
+
+		for (int n = 0; n < 27; n++)
+		{
+			int neighbourCellId = cellNeighboursBuffer[cellId * 27 + n];
+			if (neighbourCellId == -1)
+				break;
+
+			for (int g = 0; g < cellSizeBuffer[neighbourCellId] && g < maxPointsPerCell; g++)
+			{
+				int idB = cellBuffer[neighbourCellId * maxPointsPerCell + g];
+
+				if (idB == id.x)
+					continue;
+
+				//break if total neighboursCount > maxNeighboursPerPoint
+				if (totalNeighboursCount < maxNeighboursPerPoint)
+					neighboursIdsBuffer[id.x * maxNeighboursPerPoint + totalNeighboursCount] = idB;
+
+				totalNeighboursCount++;
+
+			}
+		}
+
+		neighboursCountBuffer[id.x] = totalNeighboursCount;
+
+	}
+
+}
+
+[numthreads(32, 1, 1)]
+void FindNeighboursInRadius(uint3 id : SV_DispatchThreadID)
+{
+	float searchRadiusSq = searchRadius*searchRadius;
+
+	if (id.x < pointsCount)
+	{
+		float3 predPosA = predPosBuffer[id.x].xyz;
+		float3 deltaP = float3(0, 0, 0);
+		int totalNeighboursCount = 0;
+
+		int cellId = (int)predPosA.x + (int)predPosA.y * gridSizeX + (int)predPosA.z * gridSizeX * gridSizeY;
+
+		for (int n = 0; n < 27; n++)
+		{
+			int neighbourCellId = cellNeighboursBuffer[cellId * 27 + n];
+			if (neighbourCellId == -1)
+				break;
+
+			for (int g = 0; g < cellSizeBuffer[neighbourCellId] && g < maxPointsPerCell; g++)
+			{
+				int idB = cellBuffer[neighbourCellId * maxPointsPerCell + g];
+
+				if (idB == id.x)
+					continue;
+
+				float3 predPosB = predPosBuffer[idB].xyz;
+
+				float3 dir = predPosA - predPosB;
+
+				float distSq = dot(dir, dir);
+
+				if (distSq <= searchRadiusSq)
+				{
+					if (totalNeighboursCount < maxNeighboursPerPoint)
+						neighboursIdsBuffer[id.x * maxNeighboursPerPoint + totalNeighboursCount] = idB;
+
+					totalNeighboursCount++;
+				}
+			}
+		}
+
+		neighboursCountBuffer[id.x] = totalNeighboursCount;
+
+	}
+
+}
+
+[numthreads(32, 1, 1)]
+void FindNeighboursInRadiusBruteForce(uint3 id : SV_DispatchThreadID)
+{
+	float searchRadiusSq = searchRadius*searchRadius;
+
+	if (id.x < pointsCount)
+	{
+		float3 predPosA = predPosBuffer[id.x].xyz;
+
+		int totalNeighboursCount = 0;
+
+
+		for (int idB = 0; idB < pointsCount; idB++)
+		{
+			if (idB == id.x)
+				continue;
+
+			float3 predPosB = predPosBuffer[idB].xyz;
+
+			float3 dir = predPosA - predPosB;
+
+			float distSq = dot(dir, dir);
+
+			if (distSq <= searchRadiusSq)
+			{
+				if (totalNeighboursCount < maxNeighboursPerPoint)
+					neighboursIdsBuffer[id.x * maxNeighboursPerPoint + totalNeighboursCount] = idB;
+
+				totalNeighboursCount++;
+			}
+
+		}
+
+		neighboursCountBuffer[id.x] = totalNeighboursCount;
+
+	}
+
+}

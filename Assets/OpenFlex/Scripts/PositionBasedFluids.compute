@@ -1,0 +1,341 @@
+﻿#pragma kernel ProjectSphereCollisions
+#pragma kernel CalculateLambdas
+#pragma kernel ProjectFluidConstraints
+#pragma kernel CalculateViscosity
+#pragma kernel CalculateVorticity
+
+//#pragma enable_d3d11_debug_symbols
+
+
+RWStructuredBuffer<int> neighboursCountBuffer;
+RWStructuredBuffer<int> neighboursIdsBuffer;
+
+RWStructuredBuffer<float4> debugBuffer;
+
+RWStructuredBuffer<float4> predPosBuffer;
+RWStructuredBuffer<float4> velBuffer;
+RWStructuredBuffer<float4> tempBuffer;
+RWStructuredBuffer<float> lambdaBuffer;
+RWStructuredBuffer<float> densityBuffer;
+
+StructuredBuffer<int> phaseBuffer;
+
+int pointsCount;
+float Ks;
+
+int maxPointsPerCell;
+int maxNeighboursPerPoint;
+
+float H;
+float KPOLY;
+float SPIKY;
+float REST_DENSITY;
+float EPSILON_LAMBDA;
+float EPSILON_VORTICITY;
+float K;
+float C;
+float wQH;
+
+
+
+//make calculation in squared 
+
+//float r_r = Vector3D.Substract(pi, pj).LengthSquare();
+//if(r_r > H_H) return 0;
+//return (float) (KPOLY * Math.pow(H_H - r_r, 3));
+float WPoly6(float3 pi, float3 pj)
+{
+	float3 r = pi - pj;
+	float rLen = length(r);
+	if (rLen > H || rLen == 0)
+	{
+		return 0;
+	}
+
+	return KPOLY * pow((H * H - dot(r, r)), 3);
+}
+
+
+float3 gradWPoly6(float3 pi, float3 pj)
+{
+	float3 r = pi - pj;
+	float rLen = length(r);
+	if (rLen > H || rLen == 0)
+	{
+		return float3(0.0f, 0.0f, 0.0f);
+	}
+
+	float coeff = pow((H * H) - (rLen * rLen), 2);
+	coeff *= -6 * KPOLY;
+	return r * coeff;
+}
+
+
+float3 WSpiky(float3 pi, float3 pj)
+{
+	float3 r = pi - pj;
+	float rLen = length(r);
+	if (rLen > H || rLen == 0)
+	{
+		return float3(0.0f, 0.0f, 0.0f);
+	}
+
+	float coeff = (H - rLen) * (H - rLen);
+	coeff *= SPIKY;
+	coeff /= rLen;
+	return r * -coeff;
+}
+
+
+
+
+float WAirPotential(float3 pi, float3 pj) {
+	float3 r = pi - pj;
+	float rLen = length(r);
+	if (rLen > H || rLen == 0)
+	{
+		return 0.0f;
+	}
+
+	return 1 - (rLen / H);
+}
+
+
+float sCorrCalc(float3 pi, float3 pj)
+{
+	float corr = WPoly6(pi, pj) / wQH;
+	corr *= corr * corr * corr;
+	return -K * corr;
+}
+
+
+[numthreads(32, 1, 1)]
+void ProjectSphereCollisions(uint3 id : SV_DispatchThreadID)
+{
+
+	if (id.x < pointsCount)
+	{
+		float3 predPosA = predPosBuffer[id.x].xyz;
+		float3 deltaP = float3(0, 0, 0);
+		int collisionsCount = 0;
+		//	int phase = phaseBuffer[id.x];
+
+		//	int neighboursCount = min(neighboursCountBuffer[id.x], maxNeighboursPerPoint);
+		int neighboursCount = min(neighboursCountBuffer[id.x], maxNeighboursPerPoint - 1);
+
+		for (int n = 0; n < neighboursCount; n++)
+		{
+			int idB = neighboursIdsBuffer[id.x * maxNeighboursPerPoint + n];
+
+			//	if(idB == id.x)
+			//		continue;
+
+			//		if( phase == 1 && phaseBuffer[idB] == 1)
+			//			continue;
+
+			float3 predPosB = predPosBuffer[idB].xyz;
+
+			float3 dir = predPosA - predPosB;
+
+			float dist = length(dir);
+
+			float radiusSum = 1.0f;
+
+			if (dist <= radiusSum)
+			{
+				float wA = 1.0f;
+				float wB = 1.0f;
+				float invMass = wA + wB;
+
+				float3 dP = (1.0f / invMass) * (dist - radiusSum) * normalize(dir) * Ks;
+				deltaP -= dP * wA;
+				collisionsCount++;
+			}
+		}
+
+		if (collisionsCount>0)
+			tempBuffer[id.x] = float4(deltaP / collisionsCount, 0.0f);
+		else
+			tempBuffer[id.x] = float4(0, 0, 0, 0);
+
+	}
+
+}
+
+[numthreads(32, 1, 1)]
+void CalculateLambdas(uint3 id : SV_DispatchThreadID)
+{
+
+	if (id.x < pointsCount)
+	{
+		float3 predPosA = predPosBuffer[id.x].xyz;
+		float3 deltaP = float3(0, 0, 0);
+
+		float density = 0.0f;
+		float3 gradientI = float3(0.0f, 0.0f, 0.0f);
+		float sumGradients = 0.0f;
+
+		//	int neighboursCount = min(neighboursCountBuffer[id.x], maxNeighboursPerPoint);
+		int neighboursCount = min(neighboursCountBuffer[id.x], maxNeighboursPerPoint - 1);
+
+		for (int n = 0; n < neighboursCount; n++)
+		{
+			int idB = neighboursIdsBuffer[id.x * maxNeighboursPerPoint + n];
+
+			//	if(idB == id.x)
+			//			continue;
+
+			float3 predPosB = predPosBuffer[idB].xyz;
+
+			//Calculate the lambda value for pressure correction
+			density += WPoly6(predPosA, predPosB);
+
+			//Calculate gradient with respect to j
+			float3 gradientJ = WSpiky(predPosA, predPosB) / REST_DENSITY;
+			//float3 gradientJ = gradWPoly6(predPosA, predPosB) / REST_DENSITY;
+
+
+			//Add magnitude squared to sum
+			//sumGradients += glm::length2(gradientJ);
+			sumGradients += dot(gradientJ, gradientJ);
+			gradientI += gradientJ;
+
+
+		}
+
+		//Add the particle i gradient magnitude squared to sum
+		sumGradients += dot(gradientI, gradientI);
+
+		float densityConstraint = (density / REST_DENSITY) - 1;
+
+		densityBuffer[id.x] = density;
+		lambdaBuffer[id.x] = (-1) *  densityConstraint / (sumGradients + EPSILON_LAMBDA);
+
+	}
+
+}
+
+[numthreads(32, 1, 1)]
+void ProjectFluidConstraints(uint3 id : SV_DispatchThreadID)
+{
+
+	if (id.x < pointsCount)
+	{
+		float3 predPosA = predPosBuffer[id.x].xyz;
+		float lambda = lambdaBuffer[id.x];
+		float3 deltaP = float3(0, 0, 0);
+
+		//	int neighboursCount = min(neighboursCountBuffer[id.x], maxNeighboursPerPoint);
+		int neighboursCount = min(neighboursCountBuffer[id.x], maxNeighboursPerPoint - 1);
+		for (int n = 0; n < neighboursCount; n++)
+		{
+			int idB = neighboursIdsBuffer[id.x * maxNeighboursPerPoint + n];
+
+			//	if(idB == id.x)
+			//		continue;
+
+			float3 predPosB = predPosBuffer[idB].xyz;
+
+			float lambdaSum = lambda + lambdaBuffer[idB];
+			float sCorr = sCorrCalc(predPosA, predPosB);
+
+			deltaP += WSpiky(predPosA, predPosB) * (lambdaSum + sCorr);
+		}
+
+		tempBuffer[id.x] = float4(deltaP / REST_DENSITY, 0.0f);
+
+	}
+
+}
+
+[numthreads(32, 1, 1)]
+void CalculateViscosity(uint3 id : SV_DispatchThreadID)
+{
+
+	if (id.x < pointsCount)
+	{
+		float3 predPosA = predPosBuffer[id.x].xyz;
+		float3 velA = velBuffer[id.x].xyz;
+
+		float3 visc = float3(0.0f, 0.0f, 0.0f);
+
+		//	int neighboursCount = min(neighboursCountBuffer[id.x], maxNeighboursPerPoint);
+		int neighboursCount = min(neighboursCountBuffer[id.x], maxNeighboursPerPoint - 1);
+		for (int n = 0; n < neighboursCount; n++)
+		{
+			int idB = neighboursIdsBuffer[id.x * maxNeighboursPerPoint + n];
+
+			//	if(idB == id.x)
+			//		continue;
+
+			float3 predPosB = predPosBuffer[idB].xyz;
+			float3 velB = velBuffer[idB].xyz;
+
+			float3 velocityDiff = velB - velA;
+			velocityDiff *= WPoly6(predPosA, predPosB);
+			visc += velocityDiff;
+		}
+
+		tempBuffer[id.x] = float4(visc * C, 0.0f);
+
+	}
+
+}
+
+
+[numthreads(32, 1, 1)]
+void CalculateVorticity(uint3 id : SV_DispatchThreadID)
+{
+	//Calculate omega_i
+	float3 omega = float3(0.0f, 0.0f, 0.0f);
+	float3 eta = float3(0.0f, 0.0f, 0.0f);
+
+	float3 predPosA = predPosBuffer[id.x].xyz;
+	float3 velA = velBuffer[id.x].xyz;
+
+	//	int neighboursCount = min(neighboursCountBuffer[id.x], maxNeighboursPerPoint);
+	int neighboursCount = min(neighboursCountBuffer[id.x], maxNeighboursPerPoint - 1);
+	for (int n = 0; n < neighboursCount; n++)
+	{
+		int idB = neighboursIdsBuffer[id.x * maxNeighboursPerPoint + n];
+
+		float3 predPosB = predPosBuffer[idB].xyz;
+		float3 velB = velBuffer[idB].xyz;
+
+		float3 velocityDiff = velB - velA;
+		float3 gradient = WSpiky(predPosA, predPosB);
+		omega += cross(velocityDiff, gradient);
+
+		eta += WSpiky(predPosA, predPosB);
+	}
+
+
+	//float omegaLength = length(omega);
+	float omegaLength = dot(omega, omega);
+	if (omegaLength == 0.0f)
+	{
+		//No direction for eta
+		tempBuffer[id.x] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+		return;
+	}
+
+	//	float3 eta = eta(p, omegaLength);
+	eta *= omegaLength;
+
+	//	if (eta == float3(0.0f, 0.0f, 0.0f)) 
+	if (dot(eta, eta) == 0.0f)
+	{
+		//Particle is isolated or net force is 0
+		tempBuffer[id.x] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+		return;
+	}
+
+	float3 etaNormal = normalize(eta);
+	if (isinf(etaNormal.x) || isinf(etaNormal.y) || isinf(etaNormal.z))
+	{
+		tempBuffer[id.x] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+		return;
+	}
+
+	tempBuffer[id.x] = float4(cross(etaNormal, omega) * EPSILON_VORTICITY, 0.0f);
+}
